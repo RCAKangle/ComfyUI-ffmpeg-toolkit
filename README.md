@@ -7,7 +7,6 @@ batches. The focus is reliability and compatibility with real-world workflows.
 
 - Split videos into ComfyUI IMAGE batches using FFmpeg
 - Merge IMAGE batches into MP4 (H.264) videos using FFmpeg
-- Accept VIDEO or IMAGE inputs to tolerate type inconsistencies
 - Optional FPS override for both split and merge
 - Outputs are compatible with Preview Image, VAE Encode, Save Image, and Save Video
 
