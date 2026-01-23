@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import shutil
 import tempfile
@@ -23,6 +24,52 @@ except Exception:
 
 def _is_video_input(value: Any) -> bool:
     return hasattr(value, "get_stream_source") and hasattr(value, "get_components")
+
+
+def _interleave_tensors(batch_a: torch.Tensor, batch_b: torch.Tensor) -> torch.Tensor:
+    if batch_a.dim() < 1 or batch_b.dim() < 1:
+        raise ValueError("Inputs must include a batch dimension.")
+    if batch_a.shape[0] != batch_b.shape[0]:
+        logging.warning(
+            "Interleave Frames: batch sizes differ (%s vs %s); truncating.",
+            batch_a.shape[0],
+            batch_b.shape[0],
+        )
+    count = min(batch_a.shape[0], batch_b.shape[0])
+    if count == 0:
+        raise ValueError("Inputs must contain at least one frame.")
+    batch_a = batch_a[:count]
+    batch_b = batch_b[:count]
+    return torch.stack([batch_a, batch_b], dim=1).reshape(2 * count, *batch_a.shape[1:])
+
+
+def _detect_batch_type(value: Any) -> str:
+    if isinstance(value, dict):
+        if "samples" not in value:
+            raise ValueError("LATENT input is missing 'samples'.")
+        return "LATENT"
+    if isinstance(value, torch.Tensor):
+        return "IMAGE"
+    raise ValueError("Input must be IMAGE or LATENT.")
+
+
+def _interleave_latents(batch_a: dict, batch_b: dict) -> dict:
+    samples_a = batch_a["samples"]
+    samples_b = batch_b["samples"]
+    if not isinstance(samples_a, torch.Tensor) or not isinstance(samples_b, torch.Tensor):
+        raise ValueError("LATENT samples must be torch tensors.")
+
+    output = {"samples": _interleave_tensors(samples_a, samples_b)}
+    for key, value_a in batch_a.items():
+        if key == "samples" or key not in batch_b:
+            continue
+        value_b = batch_b[key]
+        if not isinstance(value_a, torch.Tensor) or not isinstance(value_b, torch.Tensor):
+            continue
+        if value_a.shape[0] != samples_a.shape[0] or value_b.shape[0] != samples_b.shape[0]:
+            continue
+        output[key] = _interleave_tensors(value_a, value_b)
+    return output
 
 
 def _ensure_video_path(video: Any) -> tuple[str, bool]:
@@ -160,3 +207,34 @@ class FFmpegMergeFrames:
         finally:
             if os.path.isdir(frames_dir):
                 shutil.rmtree(frames_dir, ignore_errors=True)
+
+
+class InterleaveFrames:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "batch_a": ("IMAGE,LATENT", {"tooltip": "First batch to interleave."}),
+                "batch_b": ("IMAGE,LATENT", {"tooltip": "Second batch to interleave."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE,LATENT",)
+    RETURN_NAMES = ("batch",)
+    FUNCTION = "interleave"
+    CATEGORY = "ffmpeg"
+
+    def interleave(self, batch_a, batch_b):
+        type_a = _detect_batch_type(batch_a)
+        type_b = _detect_batch_type(batch_b)
+        if type_a != type_b:
+            raise ValueError("Input types must match (IMAGE+IMAGE or LATENT+LATENT).")
+
+        if type_a == "IMAGE":
+            if not isinstance(batch_a, torch.Tensor) or not isinstance(batch_b, torch.Tensor):
+                raise ValueError("IMAGE inputs must be torch tensors.")
+            return (_interleave_tensors(batch_a, batch_b),)
+
+        if not isinstance(batch_a, dict) or not isinstance(batch_b, dict):
+            raise ValueError("LATENT inputs must be dicts.")
+        return (_interleave_latents(batch_a, batch_b),)

@@ -7,6 +7,7 @@ batches. The focus is reliability and compatibility with real-world workflows.
 
 - Split videos into ComfyUI IMAGE batches using FFmpeg
 - Merge IMAGE batches into MP4 (H.264) videos using FFmpeg
+- Interleave two frame batches (IMAGE or LATENT) to alternate frames
 - Optional FPS override for both split and merge
 - Outputs are compatible with Preview Image, VAE Encode, Save Image, and Save Video
 
@@ -41,6 +42,20 @@ Notes:
 - If a VIDEO input is provided, it is passed through as `video` and its decoded
   frames are returned on `frames`.
 
+### Interleave Frames
+
+Inputs:
+- `batch_a` (IMAGE or LATENT)
+- `batch_b` (IMAGE or LATENT)
+
+Outputs:
+- `batch` (IMAGE or LATENT)
+
+Notes:
+- Inputs must be the same type (IMAGE+IMAGE or LATENT+LATENT).
+- If batch sizes differ, the node truncates to the shorter length and logs a warning.
+- Output ordering is `A1, B1, A2, B2, ...`.
+
 ## Requirements
 
 - FFmpeg installed and available on PATH
@@ -62,6 +77,9 @@ Notes:
 
 - Frames to VHS Video Combine:
   - `IMAGE batch` -> `FFmpeg Merge Frames` -> `frames` -> `VHS Video Combine`
+
+- Interleave two batches:
+  - `batch_a` + `batch_b` -> `Interleave Frames` -> `batch`
 
 ## Troubleshooting
 
