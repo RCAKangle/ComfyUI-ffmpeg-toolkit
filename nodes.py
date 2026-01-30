@@ -26,21 +26,32 @@ def _is_video_input(value: Any) -> bool:
     return hasattr(value, "get_stream_source") and hasattr(value, "get_components")
 
 
-def _interleave_tensors(batch_a: torch.Tensor, batch_b: torch.Tensor) -> torch.Tensor:
-    if batch_a.dim() < 1 or batch_b.dim() < 1:
-        raise ValueError("Inputs must include a batch dimension.")
-    if batch_a.shape[0] != batch_b.shape[0]:
+def _interleave_many_tensors(batches: list[torch.Tensor]) -> torch.Tensor:
+    if len(batches) < 2:
+        raise ValueError("At least two batches are required.")
+    for batch in batches:
+        if batch.dim() < 1:
+            raise ValueError("Inputs must include a batch dimension.")
+    base_shape = batches[0].shape[1:]
+    for batch in batches[1:]:
+        if batch.shape[1:] != base_shape:
+            raise ValueError("All inputs must have the same shape (except batch size).")
+
+    lengths = [batch.shape[0] for batch in batches]
+    if len(set(lengths)) > 1:
         logging.warning(
-            "Interleave Frames: batch sizes differ (%s vs %s); truncating.",
-            batch_a.shape[0],
-            batch_b.shape[0],
+            "Interleave Frames: batch sizes differ %s; truncating to shortest.",
+            lengths,
         )
-    count = min(batch_a.shape[0], batch_b.shape[0])
+    count = min(lengths)
     if count == 0:
         raise ValueError("Inputs must contain at least one frame.")
-    batch_a = batch_a[:count]
-    batch_b = batch_b[:count]
-    return torch.stack([batch_a, batch_b], dim=1).reshape(2 * count, *batch_a.shape[1:])
+    trimmed = [batch[:count] for batch in batches]
+    return torch.stack(trimmed, dim=1).reshape(count * len(trimmed), *base_shape)
+
+
+def _interleave_tensors(batch_a: torch.Tensor, batch_b: torch.Tensor) -> torch.Tensor:
+    return _interleave_many_tensors([batch_a, batch_b])
 
 
 def _detect_batch_type(value: Any) -> str:
@@ -53,22 +64,29 @@ def _detect_batch_type(value: Any) -> str:
     raise ValueError("Input must be IMAGE or LATENT.")
 
 
-def _interleave_latents(batch_a: dict, batch_b: dict) -> dict:
-    samples_a = batch_a["samples"]
-    samples_b = batch_b["samples"]
-    if not isinstance(samples_a, torch.Tensor) or not isinstance(samples_b, torch.Tensor):
-        raise ValueError("LATENT samples must be torch tensors.")
+def _interleave_latent_batches(batches: list[dict]) -> dict:
+    samples = [batch["samples"] for batch in batches]
+    for sample in samples:
+        if not isinstance(sample, torch.Tensor):
+            raise ValueError("LATENT samples must be torch tensors.")
 
-    output = {"samples": _interleave_tensors(samples_a, samples_b)}
-    for key, value_a in batch_a.items():
-        if key == "samples" or key not in batch_b:
+    output = {"samples": _interleave_many_tensors(samples)}
+    common_keys = set(batches[0].keys())
+    for batch in batches[1:]:
+        common_keys &= set(batch.keys())
+    common_keys.discard("samples")
+
+    for key in common_keys:
+        values = [batch[key] for batch in batches]
+        if not all(isinstance(value, torch.Tensor) for value in values):
             continue
-        value_b = batch_b[key]
-        if not isinstance(value_a, torch.Tensor) or not isinstance(value_b, torch.Tensor):
+        sample_lengths = [sample.shape[0] for sample in samples]
+        if any(value.shape[0] != length for value, length in zip(values, sample_lengths)):
             continue
-        if value_a.shape[0] != samples_a.shape[0] or value_b.shape[0] != samples_b.shape[0]:
+        try:
+            output[key] = _interleave_many_tensors(values)
+        except ValueError:
             continue
-        output[key] = _interleave_tensors(value_a, value_b)
     return output
 
 
@@ -214,8 +232,14 @@ class InterleaveFrames:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "batch_a": ("IMAGE,LATENT", {"tooltip": "First batch to interleave."}),
-                "batch_b": ("IMAGE,LATENT", {"tooltip": "Second batch to interleave."}),
+                "batch1": ("IMAGE,LATENT", {"tooltip": "First batch to interleave."}),
+                "batch2": ("IMAGE,LATENT", {"tooltip": "Second batch to interleave."}),
+            },
+            "optional": {
+                "batch3": ("IMAGE,LATENT", {"tooltip": "Third batch to interleave."}),
+                "batch4": ("IMAGE,LATENT", {"tooltip": "Fourth batch to interleave."}),
+                "batch5": ("IMAGE,LATENT", {"tooltip": "Fifth batch to interleave."}),
+                "batch6": ("IMAGE,LATENT", {"tooltip": "Sixth batch to interleave."}),
             }
         }
 
@@ -224,17 +248,29 @@ class InterleaveFrames:
     FUNCTION = "interleave"
     CATEGORY = "ffmpeg"
 
-    def interleave(self, batch_a, batch_b):
-        type_a = _detect_batch_type(batch_a)
-        type_b = _detect_batch_type(batch_b)
-        if type_a != type_b:
-            raise ValueError("Input types must match (IMAGE+IMAGE or LATENT+LATENT).")
+    def interleave(
+        self,
+        batch1,
+        batch2,
+        batch3=None,
+        batch4=None,
+        batch5=None,
+        batch6=None,
+    ):
+        batches = [batch for batch in [batch1, batch2, batch3, batch4, batch5, batch6] if batch is not None]
+        if len(batches) < 2:
+            raise ValueError("At least two batches must be provided.")
 
-        if type_a == "IMAGE":
-            if not isinstance(batch_a, torch.Tensor) or not isinstance(batch_b, torch.Tensor):
+        types = {_detect_batch_type(batch) for batch in batches}
+        if len(types) != 1:
+            raise ValueError("All inputs must have the same type (IMAGE or LATENT).")
+        batch_type = types.pop()
+
+        if batch_type == "IMAGE":
+            if not all(isinstance(batch, torch.Tensor) for batch in batches):
                 raise ValueError("IMAGE inputs must be torch tensors.")
-            return (_interleave_tensors(batch_a, batch_b),)
+            return (_interleave_many_tensors(batches),)
 
-        if not isinstance(batch_a, dict) or not isinstance(batch_b, dict):
+        if not all(isinstance(batch, dict) for batch in batches):
             raise ValueError("LATENT inputs must be dicts.")
-        return (_interleave_latents(batch_a, batch_b),)
+        return (_interleave_latent_batches(batches),)
